@@ -1,21 +1,27 @@
-// ESP32 Arduino Code (e.g., Version_3.ino)
+// ESP32 Arduino Code (Version_4.ino) - Modified for 4-bit parallel LCD
 
-#include <Wire.h>
-  #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+// --- IMPORTANT: Replace these pin numbers with your actual connections ---
+// LiquidCrystal display pins (adjust as per your wiring)
+// rs, en, d4, d5, d6, d7
+#define LCD_RS 23 // Example GPIO pin for Register Select
+#define LCD_EN 22 // Example GPIO pin for Enable
+#define LCD_D4 19 // Example GPIO pin for Data 4
+#define LCD_D5 18 // Example GPIO pin for Data 5
+#define LCD_D6 17 // Example GPIO pin for Data 6
+#define LCD_D7 16 // Example GPIO pin for Data 7
 
-// OLED definitions
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
-#define OLED_RESET -1    // Reset pin # (or -1 if sharing Arduino reset pin)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// You will need this library for character LCDs
+#include <LiquidCrystal.h>
+
+// Initialize the LiquidCrystal library with the numbers of the interface pins
+LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
 // Button pins (adjust as per your wiring)
 #define CANDIDATE1_PIN 13 // Example GPIO pin for Candidate 1
 #define CANDIDATE2_PIN 12 // Example GPIO pin for Candidate 2
-#define CANDIDATE3_PIN 14 // Example GPIO pin for Candidate 2
-#define CANDIDATE4_PIN 27 // Example GPIO pin for Candidate 2
-#define CANDIDATE5_PIN 26 // Example GPIO pin for Candidate 2
+#define CANDIDATE3_PIN 14 // Example GPIO pin for Candidate 3
+#define CANDIDATE4_PIN 27 // Example GPIO pin for Candidate 4
+#define CANDIDATE5_PIN 26 // Example GPIO pin for Candidate 5
 
 // EVM States
 enum EVMState {
@@ -34,15 +40,9 @@ EVMState currentEVMState = BOOTING;
 void setup() {
     Serial.begin(115200); // Start serial communication at 115200 baud
     
-    // Initialize OLED display
-    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
-        Serial.println(F("SSD1306 allocation failed"));
-        for (;;); // Don't proceed, loop forever
-    }
-    display.display(); // Clear display buffer
-    delay(2000); // Small delay to let display power up
-    display.clearDisplay();
-
+    // Set up the LCD's number of columns and rows:
+    lcd.begin(16, 2); // Assuming a 16x2 LCD. Change to 20,4 for 20x4 LCD.
+    
     // Configure button pins as inputs with pull-up resistors
     pinMode(CANDIDATE1_PIN, INPUT_PULLUP);
     pinMode(CANDIDATE2_PIN, INPUT_PULLUP);
@@ -149,66 +149,55 @@ void handleVoteInput() {
     }
 }
 
-// --- Display Functions ---
-void displayClearAndSetCursor() {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
+// --- Display Functions (Modified for LiquidCrystal) ---
+void lcdClearAndSetCursor() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
 }
 
 void displayBootMessage() {
-    displayClearAndSetCursor();
-    display.println("EVM Initializing...");
-    display.display();
+    lcdClearAndSetCursor();
+    lcd.print("EVM Initializing...");
 }
 
 void displayWaitingForPC() {
-    displayClearAndSetCursor();
-    display.println("Waiting for PC");
-    display.println("To Start Voting...");
-    display.display();
+    lcdClearAndSetCursor();
+    lcd.print("Waiting for PC");
+    lcd.setCursor(0,1); // Go to second line
+    lcd.print("To Start Voting...");
 }
 
 void displayReadyToVote() {
-    displayClearAndSetCursor();
-    display.setTextSize(2);
-    display.println("Please Vote");
-    display.setTextSize(1);
-    display.println("Select Candidate");
-    display.display();
+    lcdClearAndSetCursor();
+    lcd.print("Please Vote");
+    lcd.setCursor(0,1); // Go to second line
+    lcd.print("Select Candidate");
 }
 
 void displayVoteSent() {
-    displayClearAndSetCursor();
-    display.setTextSize(2);
-    display.println("Vote Sent!");
-    display.setTextSize(1);
-    display.println("Waiting for PC...");
-    display.display();
+    lcdClearAndSetCursor();
+    lcd.print("Vote Sent!");
+    lcd.setCursor(0,1); // Go to second line
+    lcd.print("Waiting for PC...");
 }
 
 void displayVoteRecordedOK() {
-    displayClearAndSetCursor();
-    display.setTextSize(2);
-    display.println("Vote Recorded!");
-    display.setTextSize(1);
-    display.println("Thank You.");
-    display.display();
+    lcdClearAndSetCursor();
+    lcd.print("Vote Recorded!");
+    lcd.setCursor(0,1); // Go to second line
+    lcd.print("Thank You.");
 }
 
 void displayVoteRecordedError() {
-    displayClearAndSetCursor();
-    display.setTextSize(2);
-    display.println("Vote Error!");
-    display.setTextSize(1);
-    display.println("Try Again.");
-    display.display();
+    lcdClearAndSetCursor();
+    lcd.print("Vote Error!");
+    lcd.setCursor(0,1); // Go to second line
+    lcd.print("Try Again.");
 }
 
 void displayError() {
-    displayClearAndSetCursor();
-    display.println("EVM Error!");
-    display.println("Check Connection.");
-    display.display();
+    lcdClearAndSetCursor();
+    lcd.print("EVM Error!");
+    lcd.setCursor(0,1); // Go to second line
+    lcd.print("Check Wiring.");
 }

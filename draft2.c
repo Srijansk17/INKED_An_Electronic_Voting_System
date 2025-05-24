@@ -1,47 +1,63 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h> // For bool type
+#include <stdbool.h>
+#include <time.h>
 
 // Platform-specific includes for serial communication and threading
 #ifdef _WIN32
-#include <windows.h> // For serial communication and Sleep()
+#include <windows.h> // For HANDLE, DWORD, etc.
 #include <process.h> // For _beginthreadex (threading)
 #else
-#include <unistd.h>  // For usleep()
-#include <fcntl.h>   // For file control options (non-blocking)
-#include <termios.h> // For serial port settings
-#include <errno.h>   // For errno
+#include <termios.h> // For serial port functions
+#include <unistd.h>  // For read(), write(), close(), usleep()
+#include <fcntl.h>   // For open()
 #include <pthread.h> // For pthreads (threading)
 #endif
 
-// --- Constants ---
-#define MAX_VOTERS 100
-#define ID_LENGTH 10
-#define NAME_LENGTH 50
-#define CANDIDATE_COUNT 5 // Assuming 5 candidates (0-4)
-#define SERIAL_READ_BUFFER_SIZE 256
+// --- Constants and Global Data Structures ---
+#define MAX_NAME_LEN 50
+#define MAX_LINE_LEN 256
 #define VOTERS_FILE "voters.txt"
-#define RESULTS_FILE "results.txt"
+#define VOTES_FILE "votes_cast.txt"
+#define SERIAL_READ_BUFFER_SIZE 128 // Size for incoming serial data
 
-// --- Data Structures ---
+// Structure to represent a voter
 typedef struct {
-    char id[ID_LENGTH];
-    char name[NAME_LENGTH];
+    int id;
+    char name[MAX_NAME_LEN];
+    bool is_eligible;
     bool has_voted;
 } Voter;
 
-// --- Global Variables ---
+// Structure to represent a candidate
+typedef struct {
+    char id[10];   // e.g., "1", "2" (matching ESP32 output)
+    char name[MAX_NAME_LEN];
+} Candidate;
+
+// Global (or passed around) array/linked list to store voters in memory
 Voter *all_voters = NULL;
-int voter_count = 0;
-int election_results[CANDIDATE_COUNT] = {0}; // Initialize all to 0
+int num_all_voters = 0;
 
-// --- State variables for managing current voting session ---
+// Global (or passed around) candidates list
+Candidate candidates[] = {
+    {"1", "Candidate Alpha"},
+    {"2", "Candidate Beta"},
+    {"3", "Candidate Gamma"},
+    {"4", "Candidate Delta"},
+    {"5", "Candidate Epsilon"}
+};
+int num_candidates = sizeof(candidates) / sizeof(candidates[0]);
+
+// State variables for managing current voting session
+// In a real GUI, this would be managed by the UI logic
 int current_voter_id_for_evm = -1; // -1 means no voter currently authorized
-volatile bool evm_is_ready = false;         // Flag for EVM status, volatile as accessed by multiple threads
-volatile bool evm_slot_open = false;        // Flag indicating EVM is ready for a vote input
+volatile bool evm_is_ready = false; // Flag for EVM status, volatile as accessed by main and serial thread
+volatile bool evm_slot_open = false; // Flag indicating EVM is ready for a vote input from authorized voter
 
-volatile bool app_running = true; // <--- NEW GLOBAL FLAG: Controls the lifetime of the serial thread
+// --- NEW GLOBAL FLAG: Controls the lifetime of the serial thread ---
+volatile bool app_running = true;
 
 // --- Serial Port Handles/File Descriptors ---
 #ifdef _WIN32
@@ -51,52 +67,610 @@ int serial_port_fd = -1;
 #endif
 
 // --- Function Prototypes ---
-// Serial Communication Functions
+// File Handling & Voter Management
+void load_voters_from_file();
+int compare_voters_by_id(const void *a, const void *b); // Comparison function for qsort/bsearch
+Voter* find_voter_by_id(int id);
+void register_new_voter(int id, const char *name, bool is_eligible);
+void update_voter_status_in_file(int voter_id, bool voted_status);
+void list_eligible_voters();
+
+// Vote Recording & Security
+void xor_encode_decode(char *data, size_t len, const char *key); // Single function for XOR
+void record_vote(int voter_id, const char *candidate_id_str);
+void calculate_and_display_results();
+
+// Serial Communication
 #ifdef _WIN32
 bool open_serial_port(const char *port_name, DWORD baud_rate);
-#else
-bool open_serial_port(const char *port_name, speed_t baud_rate);
-#endif
-void close_serial_port();
-int write_serial_data(const char *data);
 int read_serial_data(char *buffer, int max_len);
-void handle_evm_data(const char *data);
-// Thread entry point function
-#ifdef _WIN32
+bool write_serial_data(const char *data);
+void close_serial_port();
+// Thread entry point for Windows
 unsigned __stdcall serial_monitor_thread_func(void* args);
 #else
+bool open_serial_port(const char *port_name, speed_t baud_rate); // Use speed_t for baud_rate
+int read_serial_data(char *buffer, int max_len);
+bool write_serial_data(const char *data);
+void close_serial_port();
+// Thread entry point for Linux/macOS
 void *serial_monitor_thread_func(void* args);
 #endif
+void handle_evm_data(const char *data); // Processes data received from EVM
 
-// Voter Management Functions
-void register_voter();
-void list_voters();
-Voter *find_voter(const char *id);
-void load_voters_from_file();
-void save_voters_to_file();
-void record_vote(const char *voter_id, int candidate_id);
-void authorize_next_voter();
-void display_current_election_results();
-void load_results_from_file();
-void save_results_to_file();
+// --- File Handling & Voter Management Implementations ---
 
-// --- Main Program ---
+void load_voters_from_file() {
+    FILE *fp = fopen(VOTERS_FILE, "r");
+    if (!fp) {
+        perror("Info: Voters file not found, creating new one.");
+        // Create an empty file if it doesn't exist
+        fp = fopen(VOTERS_FILE, "w");
+        if (fp) fclose(fp);
+        return; // No voters to load yet
+    }
+
+    if (all_voters) {
+        free(all_voters);
+        all_voters = NULL;
+        num_all_voters = 0;
+    }
+
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), fp)) {
+        all_voters = realloc(all_voters, (num_all_voters + 1) * sizeof(Voter));
+        if (!all_voters) {
+            perror("Memory allocation failed for voters");
+            fclose(fp);
+            return;
+        }
+
+        Voter new_voter;
+        int eligible_int, voted_int; // For reading bools as ints
+        if (sscanf(line, "%d,%49[^,],%d,%d",
+                   &new_voter.id, new_voter.name, &eligible_int, &voted_int) == 4) {
+            new_voter.is_eligible = (bool)eligible_int;
+            new_voter.has_voted = (bool)voted_int;
+            all_voters[num_all_voters] = new_voter;
+            num_all_voters++;
+        } else {
+            fprintf(stderr, "Warning: Skipping malformed line in %s: %s", VOTERS_FILE, line);
+        }
+    }
+    fclose(fp);
+
+    qsort(all_voters, num_all_voters, sizeof(Voter), compare_voters_by_id);
+    printf("Loaded %d voters.\n", num_all_voters);
+}
+
+int compare_voters_by_id(const void *a, const void *b) {
+    return ((Voter *)a)->id - ((Voter *)b)->id;
+}
+
+Voter* find_voter_by_id(int id) {
+    if (!all_voters || num_all_voters == 0) {
+        return NULL;
+    }
+    Voter key_voter;
+    key_voter.id = id;
+    return (Voter*)bsearch(&key_voter, all_voters, num_all_voters, sizeof(Voter), compare_voters_by_id);
+}
+
+void register_new_voter(int id, const char *name, bool is_eligible) {
+    if (find_voter_by_id(id) != NULL) {
+        printf("Error: Voter with ID %d already exists. Cannot register.\n", id);
+        return;
+    }
+
+    FILE *fp = fopen(VOTERS_FILE, "a");
+    if (!fp) {
+        perror("Error opening voters file for appending");
+        return;
+    }
+    fprintf(fp, "%d,%s,%d,%d\n", id, name, is_eligible ? 1 : 0, 0); // 0 for has_voted initially
+    fclose(fp);
+    printf("Voter %d (%s) registered successfully.\n", id, name);
+    load_voters_from_file(); // Re-load to update in-memory list
+}
+
+void update_voter_status_in_file(int voter_id, bool voted_status) {
+    FILE *old_fp = fopen(VOTERS_FILE, "r");
+    if (!old_fp) {
+        perror("Error opening voters file for reading (update)");
+        return;
+    }
+
+    FILE *new_fp = fopen("voters_temp.txt", "w");
+    if (!new_fp) {
+        perror("Error creating temporary voters file");
+        fclose(old_fp);
+        return;
+    }
+
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), old_fp)) {
+        int id, eligible_flag, voted_flag;
+        char name[MAX_NAME_LEN];
+        if (sscanf(line, "%d,%49[^,],%d,%d", &id, name, &eligible_flag, &voted_flag) == 4) {
+            if (id == voter_id) {
+                fprintf(new_fp, "%d,%s,%d,%d\n", id, name, eligible_flag, voted_status ? 1 : 0);
+            } else {
+                fprintf(new_fp, "%s", line);
+            }
+        } else {
+            fprintf(new_fp, "%s", line);
+        }
+    }
+    fclose(old_fp);
+    fclose(new_fp);
+
+    remove(VOTERS_FILE);
+    rename("voters_temp.txt", VOTERS_FILE);
+    load_voters_from_file(); // Re-load updated data
+    printf("Voter %d status updated to voted=%d.\n", voter_id, voted_status);
+}
+
+void list_eligible_voters() {
+    if (!all_voters || num_all_voters == 0) {
+        printf("No voters registered yet.\n");
+        return;
+    }
+    printf("\n--- All Registered Voters (Eligibility & Vote Status) ---\n");
+    for (int i = 0; i < num_all_voters; i++) {
+        printf("ID: %d, Name: %s, Eligible: %s, Voted: %s\n",
+               all_voters[i].id,
+               all_voters[i].name,
+               all_voters[i].is_eligible ? "Yes" : "No",
+               all_voters[i].has_voted ? "Yes" : "No");
+    }
+    printf("----------------------------------------------------------\n");
+}
+
+// --- Vote Recording & Security Implementations ---
+
+// Simple XOR encoding/decoding function (for demonstration ONLY, not secure for real use)
+// Use a consistent key for both encoding and decoding
+void xor_encode_decode(char *data, size_t len, const char *key) {
+    size_t key_len = strlen(key);
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= key[i % key_len];
+    }
+}
+
+void record_vote(int voter_id, const char *candidate_id_str) {
+    printf("Attempting to record vote for voter %d, candidate %s...\n", voter_id, candidate_id_str);
+
+    Voter *voter = find_voter_by_id(voter_id);
+    if (!voter) {
+        printf("Error: Voter %d not found in system.\n", voter_id);
+        write_serial_data("ACK:VOTE_ERROR\n");
+        return;
+    }
+    if (!voter->is_eligible) {
+        printf("Error: Voter %d is not eligible to vote.\n", voter_id);
+        write_serial_data("ACK:VOTE_ERROR\n");
+        return;
+    }
+    if (voter->has_voted) {
+        printf("Error: Voter %d has already voted.\n", voter_id);
+        write_serial_data("ACK:VOTE_ERROR\n");
+        return;
+    }
+
+    // Check if the candidate ID from EVM is valid
+    bool candidate_found = false;
+    for (int i = 0; i < num_candidates; i++) {
+        if (strcmp(candidate_id_str, candidates[i].id) == 0) {
+            candidate_found = true;
+            break;
+        }
+    }
+    if (!candidate_found) {
+        printf("Error: Invalid candidate ID '%s' received from EVM.\n", candidate_id_str);
+        write_serial_data("ACK:VOTE_ERROR\n");
+        return;
+    }
+
+    FILE *fp = fopen(VOTES_FILE, "a");
+    if (!fp) {
+        perror("Error opening votes file for appending");
+        write_serial_data("ACK:VOTE_ERROR\n");
+        return;
+    }
+
+    char record_string[MAX_LINE_LEN];
+    time_t current_time = time(NULL);
+    // Format: VoterID,CandidateID,Timestamp
+    snprintf(record_string, sizeof(record_string), "%d,%s,%ld", voter_id, candidate_id_str, (long)current_time);
+
+    char encoding_key[] = "MY_VOTING_SECRET_KEY"; // Use a strong, consistent key
+    xor_encode_decode(record_string, strlen(record_string), encoding_key);
+
+    fprintf(fp, "%s\n", record_string);
+    fclose(fp);
+    printf("Vote from voter %d for candidate %s recorded successfully.\n", voter_id, candidate_id_str);
+
+    update_voter_status_in_file(voter_id, true); // Mark voter as voted
+
+    // Signal EVM that vote was OK
+    write_serial_data("ACK:VOTE_OK\n");
+    // Reset the current voter slot for the next vote
+    current_voter_id_for_evm = -1;
+    evm_slot_open = false;
+}
+
+void calculate_and_display_results() {
+    int vote_counts[num_candidates];
+    memset(vote_counts, 0, sizeof(vote_counts));
+
+    FILE *fp = fopen(VOTES_FILE, "r");
+    if (!fp) {
+        perror("Error opening votes file for reading. No votes cast yet?");
+        return;
+    }
+
+    char line[MAX_LINE_LEN];
+    char encoding_key[] = "MY_VOTING_SECRET_KEY"; // Same key as used for encoding
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Need a copy because xor_encode_decode modifies in place
+        char decoded_line[MAX_LINE_LEN];
+        strncpy(decoded_line, line, sizeof(decoded_line) - 1);
+        decoded_line[sizeof(decoded_line) - 1] = '\0';
+
+        // Remove trailing newline if present for decoding
+        size_t len = strlen(decoded_line);
+        if (len > 0 && decoded_line[len-1] == '\n') {
+            decoded_line[len-1] = '\0';
+            len--;
+        }
+        
+        xor_encode_decode(decoded_line, len, encoding_key);
+
+        int voter_id;
+        char candidate_id_str[10];
+        long timestamp;
+        if (sscanf(decoded_line, "%d,%9[^,],%ld", &voter_id, candidate_id_str, &timestamp) == 3) {
+            for (int i = 0; i < num_candidates; i++) {
+                if (strcmp(candidate_id_str, candidates[i].id) == 0) {
+                    vote_counts[i]++;
+                    break;
+                }
+            }
+        } else {
+            fprintf(stderr, "Warning: Skipping malformed or undecodable vote record: %s\n", line);
+        }
+    }
+    fclose(fp);
+
+    printf("\n--- Election Results ---\n");
+    for (int i = 0; i < num_candidates; i++) {
+        printf("%s (%s): %d votes\n", candidates[i].name, candidates[i].id, vote_counts[i]);
+    }
+
+    int total_votes_cast = 0;
+    for(int i = 0; i < num_candidates; i++) {
+        total_votes_cast += vote_counts[i];
+    }
+    printf("Total votes cast: %d\n", total_votes_cast);
+
+    int total_eligible = 0;
+    for(int i = 0; i < num_all_voters; i++) {
+        if(all_voters[i].is_eligible) {
+            total_eligible++;
+        }
+    }
+    if (total_eligible > 0) {
+        printf("Voter Turnout: %.2f%%\n", (double)total_votes_cast / total_eligible * 100.0);
+    } else {
+        printf("No eligible voters registered to calculate turnout.\n");
+    }
+
+    printf("------------------------\n");
+}
+
+
+// --- Serial Communication Implementations (Platform Specific) ---
+
+#ifdef _WIN32
+bool open_serial_port(const char *port_name, DWORD baud_rate) {
+    serial_port_handle = CreateFileA(port_name,
+                                     GENERIC_READ | GENERIC_WRITE,
+                                     0,    // No sharing
+                                     NULL, // No security attributes
+                                     OPEN_EXISTING,
+                                     FILE_ATTRIBUTE_NORMAL,
+                                     NULL);
+    if (serial_port_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Error opening serial port %s (Error Code: %lu)\n", port_name, GetLastError());
+        return false;
+    }
+
+    DCB dcbSerialParams = {0};
+    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
+    if (!GetCommState(serial_port_handle, &dcbSerialParams)) {
+        fprintf(stderr, "Error getting current serial port settings.\n");
+        CloseHandle(serial_port_handle);
+        return false;
+    }
+
+    dcbSerialParams.BaudRate = baud_rate;
+    dcbSerialParams.ByteSize = 8;
+    dcbSerialParams.StopBits = ONESTOPBIT;
+    dcbSerialParams.Parity = NOPARITY;
+
+    if (!SetCommState(serial_port_handle, &dcbSerialParams)) {
+        fprintf(stderr, "Error setting serial port settings.\n");
+        CloseHandle(serial_port_handle);
+        return false;
+    }
+
+    COMMTIMEOUTS timeouts = {0};
+    // Non-blocking read (VTIME=0, VMIN=0) effectively
+    timeouts.ReadIntervalTimeout = MAXDWORD; // Return immediately if any char received
+    timeouts.ReadTotalTimeoutConstant = 0;   // No total timeout
+    timeouts.ReadTotalTimeoutMultiplier = 0; // No total timeout multiplier
+
+    timeouts.WriteTotalTimeoutConstant = 50; // Total time for WriteFile
+    timeouts.WriteTotalTimeoutMultiplier = 10;// Multiplier for WriteFile
+    if (!SetCommTimeouts(serial_port_handle, &timeouts)) {
+        fprintf(stderr, "Error setting serial port timeouts.\n");
+        CloseHandle(serial_port_handle);
+        return false;
+    }
+    printf("Serial port %s opened successfully.\n", port_name);
+    return true;
+}
+
+int read_serial_data(char *buffer, int max_len) {
+    DWORD bytes_read;
+    if (!ReadFile(serial_port_handle, buffer, max_len, &bytes_read, NULL)) {
+        DWORD error = GetLastError();
+        if (error != ERROR_SUCCESS && error != ERROR_IO_PENDING && error != ERROR_INVALID_HANDLE) {
+            fprintf(stderr, "Error reading from serial port: %lu\n", error);
+            // Consider setting app_running = false here if it's a critical error
+            return -1;
+        }
+        return 0; // No data or read pending
+    }
+    return bytes_read;
+}
+
+bool write_serial_data(const char *data) {
+    DWORD bytes_written;
+    if (!WriteFile(serial_port_handle, data, strlen(data), &bytes_written, NULL)) {
+        fprintf(stderr, "Error writing to serial port: %lu\n", GetLastError());
+        return false;
+    }
+    printf("PC Sent: %s", data); // Echo what was sent
+    return true;
+}
+
+void close_serial_port() {
+    if (serial_port_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(serial_port_handle);
+        serial_port_handle = INVALID_HANDLE_VALUE;
+        printf("Serial port closed.\n");
+    }
+}
+
+#else // Linux/macOS
+bool open_serial_port(const char *port_name, speed_t baud_rate) { // Use speed_t for baud_rate
+    serial_port_fd = open(port_name, O_RDWR | O_NOCTTY | O_NDELAY); // O_NDELAY for non-blocking
+    if (serial_port_fd < 0) {
+        perror("Error opening serial port");
+        return false;
+    }
+
+    struct termios tty;
+    if (tcgetattr(serial_port_fd, &tty) != 0) {
+        perror("Error from tcgetattr");
+        close(serial_port_fd);
+        return false;
+    }
+
+    cfsetospeed(&tty, baud_rate); // Set output baud rate
+    cfsetispeed(&tty, baud_rate); // Set input baud rate
+
+    tty.c_cflag &= ~PARENB;        // No parity
+    tty.c_cflag &= ~CSTOPB;        // 1 stop bit
+    tty.c_cflag &= ~CSIZE;         // Clear data size bits
+    tty.c_cflag |= CS8;            // 8 data bits
+    tty.c_cflag |= CREAD | CLOCAL; // Enable receiver, ignore modem control lines
+
+    tty.c_lflag &= ~ICANON; // Disable canonical mode (raw input)
+    tty.c_lflag &= ~ECHO;   // Disable echo
+    tty.c_lflag &= ~ECHOE;  // Disable erasure
+    tty.c_lflag &= ~ECHONL; // Disable new-line echo
+    tty.c_lflag &= ~ISIG;   // Disable interpretation of INTR, QUIT and SUSP
+
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY); // Turn off s/w flow ctrl
+    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL); // Disable special handling of CR/LF
+
+    tty.c_oflag &= ~OPOST; // Prevent special interpretation of output bytes (e.g. newline chars)
+    tty.c_oflag &= ~ONLCR; // Prevent conversion of newline to carriage return/line feed
+
+    tty.c_cc[VTIME] = 0; // Return immediately if no data
+    tty.c_cc[VMIN] = 0;  // Non-blocking read (read returns 0 if no bytes are available)
+
+    if (tcsetattr(serial_port_fd, TCSANOW, &tty) != 0) {
+        perror("Error from tcsetattr");
+        close(serial_port_fd);
+        return false;
+    }
+    printf("Serial port %s opened successfully.\n", port_name);
+    return true;
+}
+
+int read_serial_data(char *buffer, int max_len) {
+    int bytes_read = read(serial_port_fd, buffer, max_len);
+    if (bytes_read < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0; // No data available right now (non-blocking)
+        }
+        perror("Error reading from serial port");
+        // Consider setting app_running = false here if it's a critical error
+        return -1;
+    }
+    return bytes_read;
+}
+
+bool write_serial_data(const char *data) {
+    int bytes_written = write(serial_port_fd, data, strlen(data));
+    if (bytes_written < 0) {
+        perror("Error writing to serial port");
+        return false;
+    }
+    printf("PC Sent: %s", data); // Echo what was sent
+    return true;
+}
+
+void close_serial_port() {
+    if (serial_port_fd != -1) {
+        close(serial_port_fd);
+        serial_port_fd = -1;
+        printf("Serial port closed.\n");
+    }
+}
+#endif // _WIN32
+
+
+// --- Serial Communication Logic (Called by a Thread) ---
+// Thread entry point for Windows
+#ifdef _WIN32
+unsigned __stdcall serial_monitor_thread_func(void* args) {
+#else // Linux/macOS
+void *serial_monitor_thread_func(void* args) {
+#endif
+    char read_buffer[SERIAL_READ_BUFFER_SIZE];
+    char incoming_line[SERIAL_READ_BUFFER_SIZE];
+    incoming_line[0] = '\0'; // Initialize to empty string
+    size_t incoming_line_len = 0;
+
+    printf("Serial monitor thread started.\n");
+
+    while (app_running) { // Keep running as long as the main app wants to
+        int bytes_read = read_serial_data(read_buffer, sizeof(read_buffer) - 1);
+
+        if (bytes_read > 0) {
+            // Append data to our line buffer
+            if (incoming_line_len + bytes_read >= sizeof(incoming_line)) {
+                // Buffer overflow, clear it or handle as error
+                fprintf(stderr, "Serial line buffer overflow. Clearing.\n");
+                incoming_line_len = 0;
+                incoming_line[0] = '\0';
+            }
+            strncat(incoming_line + incoming_line_len, read_buffer, bytes_read);
+            incoming_line_len += bytes_read;
+            incoming_line[incoming_line_len] = '\0'; // Null-terminate
+
+            // Check for complete lines (newline character)
+            char *newline_pos;
+            while ((newline_pos = strchr(incoming_line, '\n')) != NULL) {
+                *newline_pos = '\0'; // Null-terminate the current line
+                handle_evm_data(incoming_line); // Process the complete line
+                
+                // Shift the remaining data to the beginning of the buffer
+                size_t remaining_len = strlen(newline_pos + 1);
+                memmove(incoming_line, newline_pos + 1, remaining_len + 1);
+                incoming_line_len = remaining_len;
+            }
+        } else if (bytes_read == -1) {
+            fprintf(stderr, "Serial read error in thread. Terminating application.\n");
+            app_running = false; // Signal main thread to exit
+            break; // Exit thread loop on critical error
+        }
+        
+        // Small delay to prevent busy-waiting and high CPU usage
+        #ifdef _WIN32
+        Sleep(10); // 10 milliseconds
+        #else
+        usleep(10000); // 10,000 microseconds = 10 milliseconds
+        #endif
+    }
+    printf("Serial monitor thread gracefully stopped.\n");
+#ifdef _WIN32
+    _endthreadex(0);
+    return 0; // Should not be reached but for completeness
+#else
+    pthread_exit(NULL);
+#endif
+}
+void handle_evm_data(const char *data) {
+    // For debugging: print the raw data received
+    printf("PC Received (raw): '%s'\n", data);
+
+    char clean_data[SERIAL_READ_BUFFER_SIZE];
+    strncpy(clean_data, data, sizeof(clean_data) - 1);
+    clean_data[sizeof(clean_data) - 1] = '\0'; // Ensure null-termination
+
+    // Remove any trailing newline (\n) or carriage return (\r) characters
+    // This is crucial because `strcmp` and `strncmp` need exact matches.
+    size_t len = strlen(clean_data);
+    while (len > 0 && (clean_data[len-1] == '\n' || clean_data[len-1] == '\r')) {
+        clean_data[len-1] = '\0';
+        len--;
+    }
+    
+    // For debugging: print the cleaned data string
+    printf("PC Received (cleaned): '%s'\n", clean_data);
+
+    // Now, process the cleaned message:
+    if (strcmp(clean_data, "EVM_READY") == 0) {
+        printf("EVM reports it is ready.\n");
+        evm_is_ready = true; // Update global flag
+    } else if (strcmp(clean_data, "EVM:VOTER_SLOT_OPEN") == 0) {
+        printf("EVM confirms voter slot is open and ready for input.\n");
+        evm_slot_open = true; // Update global flag
+    } else if (strncmp(clean_data, "VOTE:", 5) == 0) {
+        // This block handles messages like "VOTE:3"
+        char candidate_id_str[10]; // Buffer to store the candidate ID (e.g., '3')
+
+        // Use sscanf to extract the candidate ID from the "VOTE:X" string
+        if (sscanf(clean_data, "VOTE:%9s", candidate_id_str) == 1) {
+            if (current_voter_id_for_evm != -1) { // Check if a voter has been authorized
+                printf("Received vote for candidate %s from authorized voter %d.\n", candidate_id_str, current_voter_id_for_evm);
+                record_vote(current_voter_id_for_evm, candidate_id_str); // Call your function to record the vote
+
+                // After processing the vote, reset flags and acknowledge
+                evm_slot_open = false; // The voting slot is no longer open
+                current_voter_id_for_evm = -1; // Reset authorized voter ID
+                write_serial_data("ACK:VOTE_OK\n"); // Send acknowledgment back to EVM
+            } else {
+                printf("Error: Received VOTE message but no voter was authorized. Message: %s\n", clean_data);
+                write_serial_data("ACK:VOTE_ERROR\n"); // Inform EVM of error
+            }
+        } else {
+            printf("Error: Malformed VOTE message received: %s\n", clean_data);
+            write_serial_data("ACK:VOTE_ERROR\n"); // Inform EVM of malformed message
+        }
+    } else if (strncmp(clean_data, "ACK:", 4) == 0) {
+        // This block handles acknowledgment messages from the ESP, like "ACK:VOTE_OK"
+        printf("Received Acknowledgment from EVM: %s\n", clean_data);
+        // You can add more specific logic here if different ACK messages require different actions
+    } else {
+        // Handle any other messages not explicitly recognized
+        printf("Unhandled message from EVM: '%s'\n", clean_data);
+    }
+}
+// --- Main Application Loop ---
+
 int main() {
-    // 1. Initialize data (load existing voters and results)
+    // 1. Initialize data (load existing voters)
     load_voters_from_file();
-    load_results_from_file();
 
     // 2. Open serial port for ESP32 communication
+    // !!! IMPORTANT: CHANGE "COM3" TO YOUR ESP32's ACTUAL PORT !!!
+    // Linux/macOS example: "/dev/ttyUSB0" or "/dev/ttyACM0"
     #ifdef _WIN32
-    // IMPORTANT: Change "COM3" to your actual COM port number!
     if (!open_serial_port("COM3", CBR_115200)) {
     #else
-    // IMPORTANT: Change "/dev/ttyUSB0" to your actual serial port path!
-    if (!open_serial_port("/dev/ttyUSB0", B115200)) {
+    if (!open_serial_port("/dev/ttyUSB0", B115200)) { // Use B115200 for 115200 baud
     #endif
         fprintf(stderr, "Failed to open serial port. Exiting.\n");
         return 1;
     }
+	
 
     // --- Start Serial Communication Thread ---
     #ifdef _WIN32
@@ -115,18 +689,19 @@ int main() {
         return 1;
     }
     #endif
+	
 
     printf("\n--- Console Voting System Control ---\n");
-    printf("Waiting for 'EVM reports it is ready.' before proceeding.\n");
+    printf("Waiting for 'EVM reports it is ready.' signal from ESP32...\n");
     printf("Please ensure your ESP32 is powered on and press its RST/EN button if needed.\n");
 
     // Wait for EVM to report ready - the background thread will update evm_is_ready
     while (!evm_is_ready && app_running) { 
         // Small delay to prevent busy-waiting for the main thread
         #ifdef _WIN32
-        Sleep(100); 
+        Sleep(100); // 100 milliseconds
         #else
-        usleep(100000); 
+        usleep(100000); // 100,000 microseconds = 100 milliseconds
         #endif
     }
 
@@ -137,7 +712,6 @@ int main() {
     }
     printf("EVM is ready! Proceeding to menu.\n");
 
-
     int choice;
     do {
         printf("\nMenu:\n");
@@ -145,28 +719,67 @@ int main() {
         printf("2. List All Voters\n");
         printf("3. Authorize Next Voter (Sends PC_READY to EVM)\n");
         printf("4. Display Current Election Results\n");
-        printf("0. Exit\n");
+        printf("0. Exit\n"); // Removed option 5 as threading handles continuous listening
         printf("Enter choice: ");
         scanf("%d", &choice);
         // Clear input buffer (important after scanf for integers)
         while (getchar() != '\n');
 
         switch (choice) {
-            case 1:
-                register_voter();
+            case 1: {
+                int id;
+                char name[MAX_NAME_LEN];
+                int eligible_flag;
+                printf("Enter new voter ID: ");
+                scanf("%d", &id);
+                while (getchar() != '\n');
+                printf("Enter voter name: ");
+                fgets(name, MAX_NAME_LEN, stdin);
+                name[strcspn(name, "\n")] = 0; // Remove newline
+                printf("Is voter eligible (1=Yes, 0=No): ");
+                scanf("%d", &eligible_flag);
+                while (getchar() != '\n');
+                register_new_voter(id, name, (bool)eligible_flag);
                 break;
+            }
             case 2:
-                list_voters();
+                list_eligible_voters();
                 break;
             case 3:
-                authorize_next_voter();
+                if (!evm_is_ready) {
+                    printf("EVM is not ready. Please wait or check connection.\n");
+                    break;
+                }
+                if (evm_slot_open) {
+                    printf("EVM is already waiting for a vote. Please wait for current voter or EVM error.\n");
+                    printf("If EVM is stuck, consider restarting EVM and PC app.\n");
+                    break;
+                }
+                int voter_to_authorize;
+                printf("Enter Voter ID to authorize for voting: ");
+                scanf("%d", &voter_to_authorize);
+                while (getchar() != '\n');
+
+                Voter *voter = find_voter_by_id(voter_to_authorize);
+                if (!voter) {
+                    printf("Voter with ID %d not found. Cannot authorize.\n", voter_to_authorize);
+                } else if (!voter->is_eligible) {
+                    printf("Voter %d is not eligible. Cannot authorize.\n", voter_to_authorize);
+                } else if (voter->has_voted) {
+                    printf("Voter %d has already voted. Cannot authorize again.\n", voter_to_authorize);
+                } else {
+                    current_voter_id_for_evm = voter_to_authorize;
+                    write_serial_data("PC_READY\n"); // Tell EVM to open slot
+                    printf("Sent PC_READY to EVM for voter %d. Waiting for EVM to confirm slot open and vote.\n", voter_to_authorize);
+                    evm_slot_open = false; // Reset this flag, EVM will set it true again
+                }
                 break;
             case 4:
-                display_current_election_results();
+                calculate_and_display_results();
                 break;
             case 0:
                 printf("Exiting application.\n");
-                app_running = false; // <--- SIGNAL THE SERIAL THREAD TO STOP
+                app_running = false; // Signal the serial thread to stop
                 break;
             default:
                 printf("Invalid choice. Please try again.\n");
@@ -182,591 +795,14 @@ int main() {
     pthread_join(serial_thread_id, NULL);
     #endif
 
-    save_voters_to_file();
-    save_results_to_file();
-
+    // Free dynamically allocated voter data
     if (all_voters) {
         free(all_voters);
+        all_voters = NULL;
     }
+    
     close_serial_port();
 
     printf("Voting system application finished.\n");
     return 0;
-}
-
-
-// --- Serial Communication Implementations ---
-
-#ifdef _WIN32
-bool open_serial_port(const char *port_name, DWORD baud_rate) {
-    serial_port_handle = CreateFile(port_name,
-                                    GENERIC_READ | GENERIC_WRITE,
-                                    0,      // no sharing
-                                    NULL,   // no security
-                                    OPEN_EXISTING,
-                                    FILE_FLAG_OVERLAPPED, // Use overlapped for non-blocking I/O
-                                    NULL);  // no templates
-
-    if (serial_port_handle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Error opening serial port %s. Error: %lu\n", port_name, GetLastError());
-        return false;
-    }
-
-    DCB dcbSerialParams = {0};
-    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
-
-    if (!GetCommState(serial_port_handle, &dcbSerialParams)) {
-        fprintf(stderr, "Error getting current serial port state.\n");
-        CloseHandle(serial_port_handle);
-        return false;
-    }
-
-    dcbSerialParams.BaudRate = baud_rate;
-    dcbSerialParams.ByteSize = 8;
-    dcbSerialParams.StopBits = ONESTOPBIT;
-    dcbSerialParams.Parity = NOPARITY;
-
-    if (!SetCommState(serial_port_handle, &dcbSerialParams)) {
-        fprintf(stderr, "Error setting serial port state.\n");
-        CloseHandle(serial_port_handle);
-        return false;
-    }
-
-    // Set timeouts for non-blocking reads and reasonable writes
-    COMMTIMEOUTS timeouts = {0};
-    timeouts.ReadIntervalTimeout = MAXDWORD; // Return immediately if no data is available
-    timeouts.ReadTotalTimeoutConstant = 0;   // No constant timeout
-    timeouts.ReadTotalTimeoutMultiplier = 0; // No multiplier timeout
-    timeouts.WriteTotalTimeoutConstant = 50;     // Max total time to write in ms
-    timeouts.WriteTotalTimeoutMultiplier = 10;   // Multiplier
-
-    if (!SetCommTimeouts(serial_port_handle, &timeouts)) {
-        fprintf(stderr, "Error setting serial port timeouts.\n");
-        CloseHandle(serial_port_handle);
-        return false;
-    }
-
-    printf("Serial port %s opened successfully.\n", port_name);
-    return true;
-}
-
-void close_serial_port() {
-    if (serial_port_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(serial_port_handle);
-        serial_port_handle = INVALID_HANDLE_VALUE;
-        printf("Serial port closed.\n");
-    }
-}
-
-int write_serial_data(const char *data) {
-    DWORD bytes_written;
-    if (serial_port_handle == INVALID_HANDLE_VALUE) return -1;
-    
-    // Add \r\n explicitly for cross-platform consistency with Arduino's Serial.println()
-    char temp_data[SERIAL_READ_BUFFER_SIZE];
-    // Ensure enough space for data + "\r\n" + null terminator
-    strncpy(temp_data, data, sizeof(temp_data) - 3); 
-    temp_data[sizeof(temp_data) - 3] = '\0'; // Ensure termination
-    strcat(temp_data, "\r\n"); 
-
-    OVERLAPPED osWrite = {0};
-    osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (osWrite.hEvent == NULL) {
-        fprintf(stderr, "Error creating write event: %lu\n", GetLastError());
-        return -1;
-    }
-
-    if (!WriteFile(serial_port_handle, temp_data, strlen(temp_data), &bytes_written, &osWrite)) {
-        if (GetLastError() != ERROR_IO_PENDING) { // Write not complete immediately
-            fprintf(stderr, "Error writing to serial port: %lu\n", GetLastError());
-            CloseHandle(osWrite.hEvent);
-            return -1;
-        }
-        // Write is pending, wait for it
-        if (WaitForSingleObject(osWrite.hEvent, INFINITE) != WAIT_OBJECT_0) {
-            fprintf(stderr, "Error waiting for write event: %lu\n", GetLastError());
-            CloseHandle(osWrite.hEvent);
-            return -1;
-        }
-        if (!GetOverlappedResult(serial_port_handle, &osWrite, &bytes_written, FALSE)) {
-            fprintf(stderr, "Error getting overlapped write result: %lu\n", GetLastError());
-            CloseHandle(osWrite.hEvent);
-            return -1;
-        }
-    }
-    CloseHandle(osWrite.hEvent);
-    printf("PC Sent: %s\n", data); // Print original data for console log
-    return bytes_written;
-}
-
-int read_serial_data(char *buffer, int max_len) {
-    DWORD bytes_read;
-    if (serial_port_handle == INVALID_HANDLE_VALUE) return -1;
-
-    OVERLAPPED osRead = {0};
-    osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (osRead.hEvent == NULL) {
-        fprintf(stderr, "Error creating read event: %lu\n", GetLastError());
-        return -1;
-    }
-
-    // Issue the read operation
-    if (!ReadFile(serial_port_handle, buffer, max_len, &bytes_read, &osRead)) {
-        if (GetLastError() == ERROR_IO_PENDING) {
-            // Read is pending, wait briefly for data
-            DWORD waitResult = WaitForSingleObject(osRead.hEvent, 100); // Wait up to 100ms
-            if (waitResult == WAIT_OBJECT_0) {
-                if (!GetOverlappedResult(serial_port_handle, &osRead, &bytes_read, FALSE)) {
-                    fprintf(stderr, "Error getting overlapped read result: %lu\n", GetLastError());
-                    CloseHandle(osRead.hEvent);
-                    return -1;
-                }
-            } else if (waitResult == WAIT_TIMEOUT) {
-                // No data within timeout, cancel the pending read
-                CancelIo(serial_port_handle); // This will cause the pending read to fail
-                bytes_read = 0; // Indicate no data read
-            } else {
-                fprintf(stderr, "Error waiting for read event: %lu\n", GetLastError());
-                CloseHandle(osRead.hEvent);
-                return -1;
-            }
-        } else {
-            fprintf(stderr, "Error reading from serial port: %lu\n", GetLastError());
-            CloseHandle(osRead.hEvent);
-            return -1;
-        }
-    }
-    CloseHandle(osRead.hEvent);
-    buffer[bytes_read] = '\0';
-    return bytes_read;
-}
-
-#else // Linux/macOS
-bool open_serial_port(const char *port_name, speed_t baud_rate) {
-    // O_RDWR   = Read/Write
-    // O_NOCTTY = No controlling terminal (prevents kernel from making it controlling tty)
-    // O_NONBLOCK = Non-blocking mode
-    serial_port_fd = open(port_name, O_RDWR | O_NOCTTY | O_NONBLOCK); 
-    if (serial_port_fd < 0) {
-        perror("Error opening serial port");
-        return false;
-    }
-
-    struct termios tty;
-    memset(&tty, 0, sizeof(tty)); // Clear struct
-
-    if (tcgetattr(serial_port_fd, &tty) != 0) {
-        perror("Error from tcgetattr");
-        close(serial_port_fd);
-        return false;
-    }
-
-    cfsetospeed(&tty, baud_rate);
-    cfsetispeed(&tty, baud_rate);
-
-    tty.c_cflag |= (CLOCAL | CREAD); // Enable the receiver and set local mode
-    tty.c_cflag &= ~PARENB;          // No parity
-    tty.c_cflag &= ~CSTOPB;          // 1 stop bit
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;              // 8 data bits
-    tty.c_cflag &= ~CRTSCTS;         // Disable RTS/CTS hardware flow control
-
-    tty.c_lflag &= ~ICANON;  // Disable canonical mode (raw input)
-    tty.c_lflag &= ~ECHO;    // Disable echo
-    tty.c_lflag &= ~ECHOE;   // Disable erasure
-    tty.c_lflag &= ~ECHONL;  // Disable new-line echo
-    tty.c_lflag &= ~ISIG;    // Disable interpretation of INTR, QUIT and SUSP
-
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY); // Turn off s/w flow control
-    tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL); // Disable any special handling of received bytes
-
-    tty.c_oflag &= ~OPOST; // Prevent special interpretation of output bytes (e.g. newline chars)
-    tty.c_oflag &= ~ONLCR; // Prevent conversion of newline to carriage return/line feed
-
-    // Set VMIN and VTIME to 0 for non-blocking read
-    tty.c_cc[VMIN] = 0;  // Read non-blocking: read returns immediately with available bytes
-    tty.c_cc[VTIME] = 0; // Read non-blocking: read returns immediately
-
-    if (tcsetattr(serial_port_fd, TCSANOW, &tty) != 0) {
-        perror("Error from tcsetattr");
-        close(serial_port_fd);
-        return false;
-    }
-
-    printf("Serial port %s opened successfully.\n", port_name);
-    return true;
-}
-
-void close_serial_port() {
-    if (serial_port_fd != -1) {
-        close(serial_port_fd);
-        serial_port_fd = -1;
-        printf("Serial port closed.\n");
-    }
-}
-
-int write_serial_data(const char *data) {
-    if (serial_port_fd == -1) return -1;
-    
-    // Add \r\n explicitly for cross-platform consistency with Arduino's Serial.println()
-    char temp_data[SERIAL_READ_BUFFER_SIZE];
-    strncpy(temp_data, data, sizeof(temp_data) - 3); 
-    temp_data[sizeof(temp_data) - 3] = '\0'; // Ensure termination
-    strcat(temp_data, "\r\n"); 
-
-    int bytes_written = write(serial_port_fd, temp_data, strlen(temp_data));
-    if (bytes_written < 0) {
-        perror("Error writing to serial port");
-    } else {
-        printf("PC Sent: %s\n", data); // Print original data for console log
-    }
-    return bytes_written;
-}
-
-int read_serial_data(char *buffer, int max_len) {
-    if (serial_port_fd == -1) return -1;
-    int bytes_read = read(serial_port_fd, buffer, max_len);
-    if (bytes_read < 0) {
-        if (errno == EWOULDBLOCK || errno == EAGAIN) {
-            return 0; // No data available right now (non-blocking)
-        }
-        perror("Error reading from serial port");
-        return -1;
-    }
-    buffer[bytes_read] = '\0';
-    return bytes_read;
-}
-#endif
-
-// --- Thread Entry Point Function ---
-#ifdef _WIN32
-unsigned __stdcall serial_monitor_thread_func(void* args)
-#else
-void *serial_monitor_thread_func(void* args)
-#endif
-{
-    char incoming_line_buffer[SERIAL_READ_BUFFER_SIZE] = {'\0'}; 
-
-    printf("Serial monitor thread started.\n");
-    while (app_running) { // Loop as long as the main application is running
-        int remaining_space = sizeof(incoming_line_buffer) - strlen(incoming_line_buffer) - 1;
-        if (remaining_space <= 0) {
-            fprintf(stderr, "Warning: Incoming serial line buffer full in thread. Clearing buffer.\n");
-            incoming_line_buffer[0] = '\0'; // Clear the buffer if full
-            remaining_space = sizeof(incoming_line_buffer) - 1; 
-        }
-
-        int bytes_read = read_serial_data(incoming_line_buffer + strlen(incoming_line_buffer), remaining_space);
-
-        if (bytes_read > 0) {
-            incoming_line_buffer[strlen(incoming_line_buffer)] = '\0'; // Null-terminate after new data
-
-            char *newline_pos;
-            // Process all complete lines currently in the buffer
-            while ((newline_pos = strchr(incoming_line_buffer, '\n')) != NULL) {
-                *newline_pos = '\0'; // Null-terminate the current line
-                handle_evm_data(incoming_line_buffer); // Process the complete line
-                
-                // Shift the remaining data (if any) to the beginning of the buffer
-                memmove(incoming_line_buffer, newline_pos + 1, strlen(newline_pos + 1) + 1);
-            }
-        } else if (bytes_read == -1) {
-            fprintf(stderr, "Serial read error in thread. Signalling application to stop.\n");
-            app_running = false; // Signal main program to exit on error
-            break; // Exit loop on error
-        }
-        // Small delay to prevent busy-waiting and allow other threads/processes time
-        #ifdef _WIN32
-        Sleep(10); 
-        #else
-        usleep(10000); 
-        #endif
-    }
-    printf("Serial monitor thread stopped.\n");
-    #ifdef _WIN32
-    _endthreadex(0); // Explicitly end the thread on Windows
-    return 0;
-    #else
-    return NULL; // Return NULL for pthreads
-    #endif
-}
-
-// --- Handle Incoming EVM Data ---
-// This function processes complete lines received from the ESP32
-void handle_evm_data(const char *data) {
-    printf("PC Received (raw): '%s'\n", data);
-
-    char clean_data[SERIAL_READ_BUFFER_SIZE];
-    strncpy(clean_data, data, sizeof(clean_data) - 1);
-    clean_data[sizeof(clean_data) - 1] = '\0';
-
-    // Remove any trailing newline (\n) or carriage return (\r) characters
-    size_t len = strlen(clean_data);
-    while (len > 0 && (clean_data[len-1] == '\n' || clean_data[len-1] == '\r')) {
-        clean_data[len-1] = '\0';
-        len--;
-    }
-    
-    printf("PC Received (cleaned): '%s'\n", clean_data); 
-
-    if (strcmp(clean_data, "EVM_READY") == 0) {
-        printf("EVM reports it is ready.\n");
-        evm_is_ready = true;
-        current_voter_id_for_evm = -1; // Reset voter ID on EVM ready
-        evm_slot_open = false; // Reset slot status
-    } else if (strcmp(clean_data, "EVM:VOTER_SLOT_OPEN") == 0) {
-        printf("EVM confirms voter slot is open and ready for input.\n");
-        evm_slot_open = true;
-    } else if (strncmp(clean_data, "VOTE:", 5) == 0) {
-        if (current_voter_id_for_evm == -1) {
-            printf("Error: Received vote but no voter was authorized. Sending ACK:VOTE_ERROR.\n");
-            write_serial_data("ACK:VOTE_ERROR");
-            return;
-        }
-
-        int candidate_id = atoi(clean_data + 5); // Extract candidate ID
-        if (candidate_id >= 0 && candidate_id < CANDIDATE_COUNT) {
-            record_vote(all_voters[current_voter_id_for_evm].id, candidate_id);
-            printf("Vote for candidate %d recorded for voter %s.\n", candidate_id, all_voters[current_voter_id_for_evm].id);
-            write_serial_data("ACK:VOTE_OK");
-            
-            // After successful vote, reset authorization for next voter
-            current_voter_id_for_evm = -1; 
-            evm_slot_open = false;
-
-        } else {
-            printf("Error: Invalid candidate ID received: %d. Sending ACK:VOTE_ERROR.\n", candidate_id);
-            write_serial_data("ACK:VOTE_ERROR");
-            // Still reset authorization even on error for next voter
-            current_voter_id_for_evm = -1; 
-            evm_slot_open = false;
-        }
-    } else {
-        printf("Unhandled message from EVM: '%s'\n", clean_data);
-    }
-}
-
-// --- Voter Management Implementations (Remain the same as before) ---
-
-void register_voter() {
-    if (voter_count >= MAX_VOTERS) {
-        printf("Maximum voters reached. Cannot register more.\n");
-        return;
-    }
-
-    // Dynamically expand voter array if needed
-    if (voter_count == 0) {
-        all_voters = (Voter *)malloc(sizeof(Voter));
-    } else {
-        Voter *temp_voters = (Voter *)realloc(all_voters, (voter_count + 1) * sizeof(Voter));
-        if (temp_voters == NULL) {
-            fprintf(stderr, "Memory re-allocation failed for new voter.\n");
-            return; // Keep existing voters
-        }
-        all_voters = temp_voters;
-    }
-
-    Voter new_voter;
-    printf("Enter new voter ID (up to %d chars): ", ID_LENGTH - 1);
-    scanf("%s", new_voter.id);
-    while (getchar() != '\n'); // Clear buffer
-
-    // Check if voter ID already exists
-    if (find_voter(new_voter.id) != NULL) {
-        printf("Voter with ID '%s' already exists.\n", new_voter.id);
-        // If realloc happened, and then ID exists, shrink array back
-        if (voter_count > 0) {
-            all_voters = (Voter *)realloc(all_voters, voter_count * sizeof(Voter));
-        } else {
-            free(all_voters);
-            all_voters = NULL;
-        }
-        return;
-    }
-
-    printf("Enter new voter Name (up to %d chars): ", NAME_LENGTH - 1);
-    fgets(new_voter.name, NAME_LENGTH, stdin);
-    new_voter.name[strcspn(new_voter.name, "\n")] = '\0'; // Remove newline
-    new_voter.has_voted = false;
-
-    all_voters[voter_count] = new_voter;
-    voter_count++;
-    printf("Voter '%s' registered successfully.\n", new_voter.name);
-}
-
-void list_voters() {
-    if (voter_count == 0) {
-        printf("No voters registered yet.\n");
-        return;
-    }
-    printf("\n--- Registered Voters ---\n");
-    for (int i = 0; i < voter_count; i++) {
-        printf("ID: %s, Name: %s, Voted: %s\n", 
-               all_voters[i].id, all_voters[i].name, 
-               all_voters[i].has_voted ? "Yes" : "No");
-    }
-    printf("-------------------------\n");
-}
-
-Voter *find_voter(const char *id) {
-    for (int i = 0; i < voter_count; i++) {
-        if (strcmp(all_voters[i].id, id) == 0) {
-            return &all_voters[i];
-        }
-    }
-    return NULL;
-}
-
-void load_voters_from_file() {
-    FILE *file = fopen(VOTERS_FILE, "r");
-    if (!file) {
-        printf("Voters file not found. Starting with no registered voters.\n");
-        return;
-    }
-
-    if (all_voters != NULL) { // Free existing data if already loaded
-        free(all_voters);
-        all_voters = NULL;
-        voter_count = 0;
-    }
-
-    Voter temp_voter;
-    int items_read;
-    while ((items_read = fscanf(file, "%[^,],%[^,],%d\n", temp_voter.id, temp_voter.name, (int *)&temp_voter.has_voted)) == 3) {
-        if (voter_count >= MAX_VOTERS) {
-            fprintf(stderr, "Warning: Max voters (%d) reached in file, truncating.\n", MAX_VOTERS);
-            break;
-        }
-        if (voter_count == 0) {
-            all_voters = (Voter *)malloc(sizeof(Voter));
-        } else {
-            Voter *temp_voters = (Voter *)realloc(all_voters, (voter_count + 1) * sizeof(Voter));
-            if (temp_voters == NULL) {
-                fprintf(stderr, "Memory re-allocation failed while loading voters. Truncating file read.\n");
-                break;
-            }
-            all_voters = temp_voters;
-        }
-        all_voters[voter_count] = temp_voter;
-        voter_count++;
-    }
-    if (items_read != EOF && items_read != 3) {
-        fprintf(stderr, "Warning: Malformed line encountered in voters file.\n");
-    }
-    printf("Loaded %d voters.\n", voter_count);
-    fclose(file);
-}
-
-void save_voters_to_file() {
-    FILE *file = fopen(VOTERS_FILE, "w");
-    if (!file) {
-        perror("Error opening voters file for writing");
-        return;
-    }
-    for (int i = 0; i < voter_count; i++) {
-        fprintf(file, "%s,%s,%d\n", all_voters[i].id, all_voters[i].name, all_voters[i].has_voted);
-    }
-    fclose(file);
-    printf("Voter data saved.\n");
-}
-
-void load_results_from_file() {
-    FILE *file = fopen(RESULTS_FILE, "r");
-    if (!file) {
-        printf("Results file not found. Starting with empty results.\n");
-        // Ensure results array is zeroed out if file doesn't exist
-        for (int i = 0; i < CANDIDATE_COUNT; i++) {
-            election_results[i] = 0;
-        }
-        return;
-    }
-    for (int i = 0; i < CANDIDATE_COUNT; i++) {
-        if (fscanf(file, "%d\n", &election_results[i]) != 1) {
-            fprintf(stderr, "Error reading results file or file is incomplete. Resetting results.\n");
-            for (int j = 0; j < CANDIDATE_COUNT; j++) {
-                election_results[j] = 0;
-            }
-            break;
-        }
-    }
-    printf("Loaded election results.\n");
-    fclose(file);
-}
-
-void save_results_to_file() {
-    FILE *file = fopen(RESULTS_FILE, "w");
-    if (!file) {
-        perror("Error opening results file for writing");
-        return;
-    }
-    for (int i = 0; i < CANDIDATE_COUNT; i++) {
-        fprintf(file, "%d\n", election_results[i]);
-    }
-    fclose(file);
-    printf("Election results saved.\n");
-}
-
-void record_vote(const char *voter_id_str, int candidate_id) {
-    Voter *voter = find_voter(voter_id_str);
-    if (voter == NULL) {
-        printf("Error: Voter '%s' not found locally (should not happen after authorization).\n", voter_id_str);
-        return;
-    }
-    if (voter->has_voted) {
-        printf("Error: Voter '%s' has already voted (should not happen after authorization).\n", voter_id_str);
-        return;
-    }
-    if (candidate_id < 0 || candidate_id >= CANDIDATE_COUNT) {
-        printf("Error: Invalid candidate ID %d received from EVM.\n", candidate_id);
-        return;
-    }
-
-    election_results[candidate_id]++;
-    voter->has_voted = true;
-    printf("Vote for candidate %d recorded for voter %s.\n", candidate_id, voter_id_str);
-    // write_serial_data("ACK:VOTE_OK") is called in handle_evm_data after record_vote
-}
-
-
-void authorize_next_voter() {
-    if (!evm_is_ready) {
-        printf("EVM is not ready. Please wait or check connection.\n");
-        return;
-    }
-    if (evm_slot_open) {
-        printf("An EVM voting slot is already open. Please wait for the current vote to complete.\n");
-        return;
-    }
-
-    char voter_id[ID_LENGTH];
-    printf("Enter voter ID to authorize: ");
-    scanf("%s", voter_id);
-    while (getchar() != '\n'); // Clear buffer
-
-    Voter *voter = find_voter(voter_id);
-    if (voter == NULL) {
-        printf("Voter with ID '%s' not found.\n", voter_id);
-        return;
-    }
-    if (voter->has_voted) {
-        printf("Voter '%s' has already voted.\n", voter_id);
-        return;
-    }
-
-    // Store the index of the authorized voter in our global variable for later lookup
-    current_voter_id_for_evm = (int)(voter - all_voters); 
-
-    // Send authorization signal to EVM
-    printf("Authorizing voter %s...\n", voter_id);
-    write_serial_data("PC_READY"); // Signal EVM to open slot
-
-    // The serial thread will now wait for "EVM:VOTER_SLOT_OPEN" and then "VOTE:X"
-}
-
-void display_current_election_results() {
-    printf("\n--- Current Election Results ---\n");
-    for (int i = 0; i < CANDIDATE_COUNT; i++) {
-        printf("Candidate %d: %d votes\n", i, election_results[i]);
-    }
-    printf("--------------------------------\n");
 }
