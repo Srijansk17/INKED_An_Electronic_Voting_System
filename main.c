@@ -535,19 +535,25 @@ void close_serial_port() {
 
 
 // --- Serial Communication Logic (Called by a Thread) ---
-
 void handle_evm_data(const char *data) {
-    printf("PC Received: %s", data); // Raw data received from EVM
+    // Keep this line for debugging raw data if needed
+    printf("PC Received (raw): '%s'\n", data); // Adding quotes to see hidden chars easily
 
-    // Remove newline character if present for clean parsing
     char clean_data[SERIAL_READ_BUFFER_SIZE];
     strncpy(clean_data, data, sizeof(clean_data) - 1);
     clean_data[sizeof(clean_data) - 1] = '\0';
-    size_t len = strlen(clean_data);
-    if (len > 0 && clean_data[len-1] == '\n') {
-        clean_data[len-1] = '\0';
-    }
 
+    // --- CRITICAL CHANGE START ---
+    // Remove any trailing newline (\n) or carriage return (\r) characters
+    size_t len = strlen(clean_data);
+    while (len > 0 && (clean_data[len-1] == '\n' || clean_data[len-1] == '\r')) {
+        clean_data[len-1] = '\0';
+        len--;
+    }
+    // --- CRITICAL CHANGE END ---
+    
+    // Add this for debugging the cleaned string
+    printf("PC Received (cleaned): '%s'\n", clean_data); 
 
     if (strcmp(clean_data, "EVM_READY") == 0) {
         printf("EVM reports it is ready.\n");
@@ -555,37 +561,26 @@ void handle_evm_data(const char *data) {
     } else if (strcmp(clean_data, "EVM:VOTER_SLOT_OPEN") == 0) {
         printf("EVM confirms voter slot is open and ready for input.\n");
         evm_slot_open = true;
-        // At this point, your GUI would show "Please ask voter to cast vote"
+        // ... (rest of the logic for EVM:VOTER_SLOT_OPEN)
     } else if (strncmp(clean_data, "VOTE:", 5) == 0) {
-        // This is a vote message, e.g., "VOTE:1" (candidate ID)
-        char candidate_id_str[10];
-        if (sscanf(clean_data + 5, "%9s", candidate_id_str) == 1) {
-            printf("Received vote for candidate: %s from EVM.\n", candidate_id_str);
-            // Now, record the vote using the current_voter_id_for_evm
-            if (current_voter_id_for_evm != -1) {
-                record_vote(current_voter_id_for_evm, candidate_id_str);
-            } else {
-                fprintf(stderr, "Error: Received vote from EVM but no voter was authorized! (Candidate: %s)\n", candidate_id_str);
-                write_serial_data("ACK:VOTE_ERROR\n");
-            }
-        } else {
-            fprintf(stderr, "Malformed VOTE message from EVM: %s\n", clean_data);
-            write_serial_data("ACK:VOTE_ERROR\n");
-        }
+        // ... (rest of the logic for VOTE)
     } else {
-        printf("Unhandled message from EVM: %s\n", clean_data);
+        printf("Unhandled message from EVM: '%s'\n", clean_data); // Keep quotes for debugging
     }
 }
+// Add this global flag (if not already present near other globals)
+// volatile bool keep_serial_listening = false; // Declare this globally if not already
 
-// This function should be run in a separate thread in a GUI application
-// to continuously read from the serial port.
 void serial_monitor_loop() {
     char read_buffer[SERIAL_READ_BUFFER_SIZE];
-    int bytes_read_total = 0;
-    char incoming_line[SERIAL_READ_BUFFER_SIZE]; // To build up a full line
+    char incoming_line[SERIAL_READ_BUFFER_SIZE];
+    incoming_line[0] = '\0'; // Initialize to empty string
 
-    printf("Starting serial monitor loop...\n");
-    while (true) { // Replace 'true' with a global flag that controls application exit
+    printf("Starting serial monitor loop (Waiting for EVM_READY)...\n");
+
+    // Loop until EVM_READY is true or a serial error occurs
+    // We assume evm_is_ready is updated by handle_evm_data
+    while (!evm_is_ready) { // <--- KEY CHANGE: Loop as long as EVM is NOT ready
         int bytes_read = read_serial_data(read_buffer, sizeof(read_buffer) - 1);
 
         if (bytes_read > 0) {
@@ -599,21 +594,25 @@ void serial_monitor_loop() {
                 *newline_pos = '\0'; // Null-terminate the current line
                 handle_evm_data(incoming_line); // Process the complete line
                 
+                // If EVM_READY is now true, the outer while loop condition will become false
+                // and we will exit this loop gracefully.
+                
                 // Shift the remaining data to the beginning of the buffer
                 memmove(incoming_line, newline_pos + 1, strlen(newline_pos + 1) + 1);
             }
         } else if (bytes_read == -1) {
             fprintf(stderr, "Serial read error. Stopping serial monitor loop.\n");
+            // Optionally, handle what happens if serial port breaks before EVM_READY
             break; // Exit loop on error
         }
-        // Small delay to prevent busy-waiting and allow other threads to run
+        // Small delay to prevent busy-waiting
         #ifdef _WIN32
         Sleep(10); // 10 milliseconds
         #else
         usleep(10000); // 10,000 microseconds = 10 milliseconds
         #endif
     }
-    printf("Serial monitor loop stopped.\n");
+    printf("Serial monitor loop stopped, EVM is ready. Returning to main menu.\n");
 }
 
 // --- Main Application Loop (Conceptual) ---

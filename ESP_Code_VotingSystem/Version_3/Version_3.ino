@@ -57,6 +57,10 @@ void setup() {
 }
 
 void loop() {
+    // --- FIX: Declare votedCandidate here, outside the switch ---
+    int votedCandidate = 0; 
+    // --- End FIX ---
+
     handleSerialCommunication(); // Check for commands from PC
 
     switch (currentEVMState) {
@@ -73,7 +77,6 @@ void loop() {
             lcd.setCursor(0, 1);
             lcd.print("Select Candidate");
 
-            int votedCandidate = 0;
             // Debounce logic: only read button if enough time has passed since last press
             if ((millis() - lastButtonPressTime) > DEBOUNCE_DELAY) {
                 if (digitalRead(BTN1) == HIGH) votedCandidate = 1;
