@@ -1,0 +1,54 @@
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:1
+load:0x3fff0030,len:4916
+load:0x40078000,len:16492
+load:0x40080400,len:4
+load:0x40080404,len:3524
+entry 0x400805b8
+1,Voted to: 1
+EVM Ready !
+2,Voted to: 5
+EVM Ready !
+3,Voted to: 1
+EVM Ready !
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:1
+load:0x3fff0030,len:4916
+load:0x40078000,len:16492
+load:0x40080400,len:4
+load:0x40080404,len:3524
+entry 0xets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:1
+load:0x3fff0030,len:4916
+load:0x40078000,len:16492
+load:0x40080400,len:4
+load:0x40080404,len:3524
+entry 0x400805b8
+1,Voted to: 1
+EVM Ready !
+2,Voted to: 2
+EVM Ready !
+3,Voted to: 3
+EVM Ready !
+4,Voted to: 4
+EVM Ready !
+5,Voted to: 5
+EVM Ready !
+6,Voted to: 3
+EVM Ready !
+7,Voted to: 3
+EVM Ready !
+8,Voted to: 5
+EVM Ready !

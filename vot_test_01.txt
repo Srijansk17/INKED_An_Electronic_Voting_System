@@ -1,0 +1,3 @@
+Vote 3 voted to candidate 5
+Vote 4 voted to candidate 5
+Vote 5 voted to candidate 4
