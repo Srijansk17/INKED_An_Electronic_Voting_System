@@ -556,7 +556,7 @@ void *serial_monitor_thread_func(void* args) {
             // Append data to our line buffer
             if (incoming_line_len + bytes_read >= sizeof(incoming_line)) {
                 // Buffer overflow, clear it or handle as error
-                fprintf(stderr, "Serial line buffer overflow. Clearing.\n");
+                /*fprintf(stderr, "Serial line buffer overflow. Clearing.\n");*/
                 incoming_line_len = 0;
                 incoming_line[0] = '\0';
             }
@@ -598,7 +598,7 @@ void *serial_monitor_thread_func(void* args) {
 }
 void handle_evm_data(const char *data) {
     // For debugging: print the raw data received
-    printf("PC Received (raw): '%s'\n", data);
+    /*printf("PC Received (raw): '%s'\n", data);*/
 
     char clean_data[SERIAL_READ_BUFFER_SIZE];
     strncpy(clean_data, data, sizeof(clean_data) - 1);
@@ -613,7 +613,7 @@ void handle_evm_data(const char *data) {
     }
     
     // For debugging: print the cleaned data string
-    printf("PC Received (cleaned): '%s'\n", clean_data);
+    /*printf("PC Received (cleaned): '%s'\n", clean_data);*/
 
     // Now, process the cleaned message:
     if (strcmp(clean_data, "EVM_READY") == 0) {
@@ -650,7 +650,7 @@ void handle_evm_data(const char *data) {
         // You can add more specific logic here if different ACK messages require different actions
     } else {
         // Handle any other messages not explicitly recognized
-        printf("Unhandled message from EVM: '%s'\n", clean_data);
+        /*printf("Unhandled message from EVM: '%s'\n", clean_data);*/
     }
 }
 // --- Main Application Loop ---
@@ -711,7 +711,12 @@ int main() {
         return 1;
     }
     printf("EVM is ready! Proceeding to menu.\n");
-
+	printf("   ___            _     __            _ _    ______          _     _                  _ \n");
+    printf("  |_  |          | |   / _|          (_) |   | ___ \\        | |   | |                | |\n");
+    printf("    | | __ _  ___| | _| |_ _ __ _   _ _| |_  | |_/ / __ ___ | |__ | | ___ _ __ ___   | |\n");
+    printf("    | |/ _` |/ __| |/ /  _| '__| | | | | __| |  __/ '__/ _ \\| '_ \\| |/ _ \\ '_ ` _ \\  | |\n");
+    printf("/\\__/ / (_| | (__|   <| | | |  | |_| | | |_  | |  | | | (_) | |_) | |  __/ | | | | | |_|\n");
+    printf("\\____/ \\__,_|\\___|_|\\_\\_| |_|   \\__,_|_|\\__| \\_|  |_|  \\___/|_.__/|_|\\___|_| |_| |_| (_)\n");
     int choice;
     do {
         printf("\nMenu:\n");
