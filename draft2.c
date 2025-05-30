@@ -283,7 +283,7 @@ void record_vote(int voter_id, const char *candidate_id_str) {
     // Format: VoterID,CandidateID,Timestamp
     snprintf(record_string, sizeof(record_string), "%d,%s,%ld", voter_id, candidate_id_str, (long)current_time);
 
-    char encoding_key[] = "MY_VOTING_SECRET_KEY"; // Use a strong, consistent key
+    char encoding_key[] = "Teja_mam_is_Best"; // Use a strong, consistent key
     xor_encode_decode(record_string, strlen(record_string), encoding_key);
 
     fprintf(fp, "%s\n", record_string);
@@ -310,7 +310,7 @@ void calculate_and_display_results() {
     }
 
     char line[MAX_LINE_LEN];
-    char encoding_key[] = "MY_VOTING_SECRET_KEY"; // Same key as used for encoding
+    char encoding_key[] = "Teja_mam_is_Best"; // Same key as used for encoding
 
     while (fgets(line, sizeof(line), fp)) {
         // Need a copy because xor_encode_decode modifies in place

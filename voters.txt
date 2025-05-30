@@ -1,1 +1,8 @@
-1,Vamshi,1,1
+1,SriRanga,1,0
+2,SriVamshi,1,0
+3,SrijanKotabagi,1,0
+4,TejaL,1,1
+5,Modi,1,0
+6,ElonMusk,0,0
+7,Trump,0,0
+8,Pooja,1,1
